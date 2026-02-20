@@ -1,6 +1,6 @@
 # 🔍 AA-YOLO: Official Implementation of "An Anomaly-Aware Detection Head for Frugal and Robust Infrared Small Target Detection"
 
-Welcome to the official implementation repository of our paper! This project is a Python implementation of the Anomaly-Aware version of YOLO detector, as described in our work. 📝
+Welcome to the official implementation repository of our [paper](https://doi.org/10.1016/j.engappai.2026.114186)! This project is a Python implementation of the Anomaly-Aware version of YOLO detector, as described in our work. 📝
 
 ## 🚀 Features
 
@@ -56,8 +56,23 @@ python train.py --workers 8 --batch-size 16 --data data/sirst.yaml --img 640 640
 
 ## 📝 Citing this Work
 
-If you find our method interesting and useful, please cite using the bibtex generated from EAAI.
+Please cite using the bibtex generated from [the EAAI article page](https://doi.org/10.1016/j.engappai.2026.114186)
 
+for example as:
+
+```
+@article{CIOCARLAN2026114186,
+title = {An anomaly-aware detection head for frugal and robust Infrared Small Target Detection},
+journal = {Engineering Applications of Artificial Intelligence},
+volume = {170},
+pages = {114186},
+year = {2026},
+issn = {0952-1976},
+doi = {https://doi.org/10.1016/j.engappai.2026.114186},
+url = {https://www.sciencedirect.com/science/article/pii/S0952197626004677},
+author = {Alina Ciocarlan and Sylvie {Le Hégarat-Mascle} and Sidonie Lefebvre},
+}
+```
 ## Acknowledgments
 
 This repo is built on yolov7 repo: [https://github.com/WongKinYiu/yolov7](https://github.com/WongKinYiu/yolov7)
