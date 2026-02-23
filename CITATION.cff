@@ -12,7 +12,7 @@ date-released: 2026-02-18
 url: "https://www.sciencedirect.com/science/article/pii/S0952197626004677"
 doi: 10.1016/j.engappai.2026.114186
 preferred-citation:
-  type: "journal-paper"
+  type: "article"
   title: "An anomaly-aware detection head for frugal and robust Infrared Small Target Detection"
   authors:
     - family-names: "Ciocarlan"
@@ -21,6 +21,6 @@ preferred-citation:
       given-names: "Sylvie"
     - family-names: "Lefebvre"
       given-names: "Sidonie"
-  collection-title: "Engineering Applications of Artificial Intelligence"
+  journal: "Engineering Applications of Artificial Intelligence"
   year: 2026
   
