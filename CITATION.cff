@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite its corresponding paper."
+title: "An anomaly-aware detection head for frugal and robust Infrared Small Target Detection"
+authors:
+  - family-names: "Ciocarlan"
+    given-names: "Alina"
+  - family-names: "Le Hégarat-Mascle"
+    given-names: "Sylvie"
+  - family-names: "Lefebvre"
+    given-names: "Sidonie"
+date-released: 2026-02-18
+url: "https://www.sciencedirect.com/science/article/pii/S0952197626004677"
+doi: 10.1016/j.engappai.2026.114186
+preferred-citation:
+  type: "journal-paper"
+  title: "An anomaly-aware detection head for frugal and robust Infrared Small Target Detection"
+  authors:
+    - family-names: "Ciocarlan"
+      given-names: "Alina"
+    - family-names: "Le Hégarat-Mascle"
+      given-names: "Sylvie"
+    - family-names: "Lefebvre"
+      given-names: "Sidonie"
+  collection-title: "Engineering Applications of Artificial Intelligence"
+  year: 2026
+  
