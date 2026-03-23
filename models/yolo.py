@@ -1,13 +1,24 @@
 import argparse
 import logging
+import math
+import os
 import sys
 from copy import deepcopy
 
-sys.path.append('./')  # to run '$ python *.py' files in subdirectories
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logger = logging.getLogger(__name__)
 import torch
-from models.common import *
-from models.experimental import *
+import torch.nn as nn
+from pathlib import Path
+from models.common import Conv, DWConv, ImplicitA, ImplicitM, NMS, autoShape, filtering2D, anomaly_testing, \
+    RobustConv, RobustConv2, GhostConv, RepConv, RepConv_OREPA, RepBottleneck, RepBottleneckCSPA, \
+    RepBottleneckCSPB, RepBottleneckCSPC, RepRes, RepResCSPA, RepResCSPB, RepResCSPC, RepResX, RepResXCSPA, \
+    RepResXCSPB, RepResXCSPC, GhostCSPA, GhostCSPB, GhostCSPC, DownC, SPP, SPPF, SPPCSPC, GhostSPPCSPC, \
+    Focus, Stem, GhostStem, Bottleneck, BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, Res, ResCSPA, \
+    ResCSPB, ResCSPC, ResX, ResXCSPA, ResXCSPB, ResXCSPC, Ghost, SwinTransformerBlock, STCSPA, STCSPB, STCSPC, \
+    SwinTransformer2Block, ST2CSPA, ST2CSPB, ST2CSPC, \
+    Concat, Contract, Expand, MP, SP, Shortcut, Foldcut, ReOrg, Chuncat
+from models.experimental import attempt_load
 from utils.autoanchor import check_anchor_order
 from utils.general import make_divisible, check_file, set_logging
 from utils.torch_utils import time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
@@ -20,15 +31,81 @@ except ImportError:
     thop = None
 
 
-class Detect(nn.Module):
+class BaseDetect(nn.Module):
+    """Base class for all YOLO detection heads.
+
+    Provides shared utilities: grid generation, box format conversion,
+    and common class attributes used across Detect, IDetect, IDetect_AA,
+    IKeypoint, IAuxDetect, and IBin.
+    """
     stride = None  # strides computed during build
     export = False  # onnx export
     end2end = False
     include_nms = False
     concat = False
 
+    @staticmethod
+    def _make_grid(nx: int = 20, ny: int = 20) -> torch.Tensor:
+        """Create a meshgrid for anchor box coordinate decoding.
+
+        Args:
+            nx: Number of grid cells in x direction.
+            ny: Number of grid cells in y direction.
+
+        Returns:
+            Grid tensor of shape (1, 1, ny, nx, 2).
+        """
+        yv, xv = torch.meshgrid(torch.arange(ny), torch.arange(nx), indexing='ij')
+        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+
+    def convert(self, z: list) -> tuple:
+        """Convert predictions from xywh to xyxy format for NMS.
+
+        Args:
+            z: List of prediction tensors from each detection layer.
+
+        Returns:
+            Tuple of (boxes, scores) in xyxy format.
+        """
+        z = torch.cat(z, 1)
+        box = z[:, :, :4]
+        conf = z[:, :, 4:5]
+        score = z[:, :, 5:]
+        score *= conf
+        convert_matrix = torch.tensor(
+            [[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
+            dtype=torch.float32, device=z.device
+        )
+        box @= convert_matrix
+        return (box, score)
+
+    def _output_with_mode(self, z, x, no=None):
+        """Common output routing based on training/inference mode.
+
+        Args:
+            z: List of decoded inference outputs.
+            x: List of raw layer outputs.
+            no: Number of outputs per anchor (for view reshape).
+
+        Returns:
+            Model output appropriate for current mode.
+        """
+        if self.training:
+            return x
+        elif self.end2end:
+            return torch.cat(z, 1)
+        elif self.include_nms:
+            z = self.convert(z)
+            return (z,)
+        elif self.concat:
+            return torch.cat(z, 1)
+        else:
+            return (torch.cat(z, 1), x)
+
+
+class Detect(BaseDetect):
     def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
-        super(Detect, self).__init__()
+        super().__init__()
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
@@ -40,7 +117,6 @@ class Detect(nn.Module):
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
 
     def forward(self, x):
-        # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
         for i in range(self.nl):
@@ -76,33 +152,10 @@ class Detect(nn.Module):
 
         return out
 
-    @staticmethod
-    def _make_grid(nx=20, ny=20):
-        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
-        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
-    def convert(self, z):
-        z = torch.cat(z, 1)
-        box = z[:, :, :4]
-        conf = z[:, :, 4:5]
-        score = z[:, :, 5:]
-        score *= conf
-        convert_matrix = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
-                                           dtype=torch.float32,
-                                           device=z.device)
-        box @= convert_matrix                          
-        return (box, score)
-
-
-class IDetect(nn.Module):
-    stride = None  # strides computed during build
-    export = False  # onnx export
-    end2end = False
-    include_nms = False
-    concat = False
-
+class IDetect(BaseDetect):
     def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
-        super(IDetect, self).__init__()
+        super().__init__()
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
@@ -117,7 +170,6 @@ class IDetect(nn.Module):
         self.im = nn.ModuleList(ImplicitM(self.no * self.na) for _ in ch)
 
     def forward(self, x):
-        # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
         for i in range(self.nl):
@@ -136,9 +188,8 @@ class IDetect(nn.Module):
                 z.append(y.view(bs, -1, self.no))
 
         return x if self.training else (torch.cat(z, 1), x)
-    
+
     def fuseforward(self, x):
-        # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
         for i in range(self.nl):
@@ -174,9 +225,9 @@ class IDetect(nn.Module):
             out = (torch.cat(z, 1), x)
 
         return out
-    
+
     def fuse(self):
-        print("IDetect.fuse")
+        logger.debug("IDetect.fuse")
         # fuse ImplicitA and Convolution
         for i in range(len(self.m)):
             c1,c2,_,_ = self.m[i].weight.shape
@@ -188,33 +239,39 @@ class IDetect(nn.Module):
             c1,c2, _,_ = self.im[i].implicit.shape
             self.m[i].bias *= self.im[i].implicit.reshape(c2)
             self.m[i].weight *= self.im[i].implicit.transpose(0,1)
-            
-    @staticmethod
-    def _make_grid(nx=20, ny=20):
-        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
-        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
-    def convert(self, z):
-        z = torch.cat(z, 1)
-        box = z[:, :, :4]
-        conf = z[:, :, 4:5]
-        score = z[:, :, 5:]
-        score *= conf
-        convert_matrix = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
-                                           dtype=torch.float32,
-                                           device=z.device)
-        box @= convert_matrix                          
-        return (box, score)
+class IDetect_AA(BaseDetect):
+    """Anomaly-Aware Implicit Detection Head.
 
-class IDetect_AA(nn.Module):
-    stride = None  # strides computed during build
-    export = False  # onnx export
-    end2end = False
-    include_nms = False
-    concat = False
+    Extends the IDetect head with an anomaly-aware objectness prediction
+    mechanism. Instead of learning objectness via standard convolution,
+    this head uses a 2D filtering module followed by statistical anomaly
+    testing to compute objectness scores.
+
+    The key innovation is replacing the learned objectness branch with:
+    1. A filtering2D module that processes backbone features
+    2. An anomaly_testing module that computes statistical anomaly scores
+
+    This approach is more robust under limited data, noise, and domain
+    shift scenarios typical of infrared small target detection.
+
+    Args:
+        nc: Number of object classes (default: 80).
+        anchors: Anchor box configurations per detection layer.
+        aa_chan: Number of channels for the anomaly-aware filtering
+                per anchor (default: 8).
+        ch: Tuple of input channel sizes from backbone feature maps.
+
+    Attributes:
+        m: ModuleList of 1x1 conv layers for box regression + classification.
+        filtering: ModuleList of filtering2D modules for anomaly detection.
+        stat_test: anomaly_testing module for computing anomaly scores.
+        ia: ModuleList of ImplicitA modules (additive implicit knowledge).
+        im: ModuleList of ImplicitM modules (multiplicative implicit knowledge).
+    """
 
     def __init__(self, nc=80, anchors=(), aa_chan=8, ch=()):  # detection layer
-        super(IDetect_AA, self).__init__()
+        super().__init__()
         self.nc = nc  # number of classes
         self.no = nc + 4  # number of outputs per anchor, without objectness
         self.nl = len(anchors)  # number of detection layers
@@ -233,6 +290,9 @@ class IDetect_AA(nn.Module):
     def forward(self, x ):
         z = []  # inference output
         self.training |= self.export
+        # Propagate export flag to anomaly module for ONNX-compatible path
+        if hasattr(self, 'export') and self.export:
+            self.stat_test.export_mode = True
         for i in range(self.nl):
             xall = self.m[i](self.ia[i](x[i]))  # conv
             xall = self.im[i](xall)
@@ -259,11 +319,12 @@ class IDetect_AA(nn.Module):
                 z.append(y.view(bs, -1, self.no+1))
 
         return x if self.training else (torch.cat(z, 1), x)
-    
+
     def fuseforward(self, x):
-        # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
+        if hasattr(self, 'export') and self.export:
+            self.stat_test.export_mode = True
         for i in range(self.nl):
             xall = self.m[i](x[i])  # conv
             bs, _, ny, nx = xall.shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
@@ -307,9 +368,9 @@ class IDetect_AA(nn.Module):
             out = (torch.cat(z, 1), x)
 
         return out
-    
+
     def fuse(self):
-        print("IDetect_AA.fuse")
+        logger.debug("IDetect_AA.fuse")
         # fuse ImplicitA and Convolution
         for i in range(len(self.m)):
             c1,c2,_,_ = self.m[i].weight.shape
@@ -321,31 +382,11 @@ class IDetect_AA(nn.Module):
             c1,c2, _,_ = self.im[i].implicit.shape
             self.m[i].bias *= self.im[i].implicit.reshape(c2)
             self.m[i].weight *= self.im[i].implicit.transpose(0,1)
-            
-    @staticmethod
-    def _make_grid(nx=20, ny=20):
-        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
-        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
-
-    def convert(self, z):
-        z = torch.cat(z, 1)
-        box = z[:, :, :4]
-        conf = z[:, :, 4:5]
-        score = z[:, :, 5:]
-        score *= conf
-        convert_matrix = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
-                                           dtype=torch.float32,
-                                           device=z.device)
-        box @= convert_matrix                          
-        return (box, score)
 
 
-class IKeypoint(nn.Module):
-    stride = None  # strides computed during build
-    export = False  # onnx export
-
+class IKeypoint(BaseDetect):
     def __init__(self, nc=80, anchors=(), nkpt=17, ch=(), inplace=True, dw_conv_kpt=False):  # detection layer
-        super(IKeypoint, self).__init__()
+        super().__init__()
         self.nc = nc  # number of classes
         self.nkpt = nkpt
         self.dw_conv_kpt = dw_conv_kpt
@@ -379,7 +420,6 @@ class IKeypoint(nn.Module):
         self.inplace = inplace  # use in-place ops (e.g. slice assignment)
 
     def forward(self, x):
-        # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
         for i in range(self.nl):
@@ -410,16 +450,6 @@ class IKeypoint(nn.Module):
                     if self.nkpt != 0:
                         x_kpt[..., 0::3] = (x_kpt[..., ::3] * 2. - 0.5 + kpt_grid_x.repeat(1,1,1,1,17)) * self.stride[i]  # xy
                         x_kpt[..., 1::3] = (x_kpt[..., 1::3] * 2. - 0.5 + kpt_grid_y.repeat(1,1,1,1,17)) * self.stride[i]  # xy
-                        #x_kpt[..., 0::3] = (x_kpt[..., ::3] + kpt_grid_x.repeat(1,1,1,1,17)) * self.stride[i]  # xy
-                        #x_kpt[..., 1::3] = (x_kpt[..., 1::3] + kpt_grid_y.repeat(1,1,1,1,17)) * self.stride[i]  # xy
-                        #print('=============')
-                        #print(self.anchor_grid[i].shape)
-                        #print(self.anchor_grid[i][...,0].unsqueeze(4).shape)
-                        #print(x_kpt[..., 0::3].shape)
-                        #x_kpt[..., 0::3] = ((x_kpt[..., 0::3].tanh() * 2.) ** 3 * self.anchor_grid[i][...,0].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_x.repeat(1,1,1,1,17) * self.stride[i]  # xy
-                        #x_kpt[..., 1::3] = ((x_kpt[..., 1::3].tanh() * 2.) ** 3 * self.anchor_grid[i][...,1].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_y.repeat(1,1,1,1,17) * self.stride[i]  # xy
-                        #x_kpt[..., 0::3] = (((x_kpt[..., 0::3].sigmoid() * 4.) ** 2 - 8.) * self.anchor_grid[i][...,0].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_x.repeat(1,1,1,1,17) * self.stride[i]  # xy
-                        #x_kpt[..., 1::3] = (((x_kpt[..., 1::3].sigmoid() * 4.) ** 2 - 8.) * self.anchor_grid[i][...,1].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_y.repeat(1,1,1,1,17) * self.stride[i]  # xy
                         x_kpt[..., 2::3] = x_kpt[..., 2::3].sigmoid()
 
                     y = torch.cat((xy, wh, y[..., 4:], x_kpt), dim = -1)
@@ -435,21 +465,10 @@ class IKeypoint(nn.Module):
 
         return x if self.training else (torch.cat(z, 1), x)
 
-    @staticmethod
-    def _make_grid(nx=20, ny=20):
-        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
-        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
-
-class IAuxDetect(nn.Module):
-    stride = None  # strides computed during build
-    export = False  # onnx export
-    end2end = False
-    include_nms = False
-    concat = False
-
+class IAuxDetect(BaseDetect):
     def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
-        super(IAuxDetect, self).__init__()
+        super().__init__()
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
@@ -465,7 +484,6 @@ class IAuxDetect(nn.Module):
         self.im = nn.ModuleList(ImplicitM(self.no * self.na) for _ in ch[:self.nl])
 
     def forward(self, x):
-        # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
         for i in range(self.nl):
@@ -495,7 +513,6 @@ class IAuxDetect(nn.Module):
         return x if self.training else (torch.cat(z, 1), x[:self.nl])
 
     def fuseforward(self, x):
-        # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
         for i in range(self.nl):
@@ -530,9 +547,9 @@ class IAuxDetect(nn.Module):
             out = (torch.cat(z, 1), x)
 
         return out
-    
+
     def fuse(self):
-        print("IAuxDetect.fuse")
+        logger.debug("IAuxDetect.fuse")
         # fuse ImplicitA and Convolution
         for i in range(len(self.m)):
             c1,c2,_,_ = self.m[i].weight.shape
@@ -545,30 +562,10 @@ class IAuxDetect(nn.Module):
             self.m[i].bias *= self.im[i].implicit.reshape(c2)
             self.m[i].weight *= self.im[i].implicit.transpose(0,1)
 
-    @staticmethod
-    def _make_grid(nx=20, ny=20):
-        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
-        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
-    def convert(self, z):
-        z = torch.cat(z, 1)
-        box = z[:, :, :4]
-        conf = z[:, :, 4:5]
-        score = z[:, :, 5:]
-        score *= conf
-        convert_matrix = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
-                                           dtype=torch.float32,
-                                           device=z.device)
-        box @= convert_matrix                          
-        return (box, score)
-
-
-class IBin(nn.Module):
-    stride = None  # strides computed during build
-    export = False  # onnx export
-
+class IBin(BaseDetect):
     def __init__(self, nc=80, anchors=(), ch=(), bin_count=21):  # detection layer
-        super(IBin, self).__init__()
+        super().__init__()
         self.nc = nc  # number of classes
         self.bin_count = bin_count
 
@@ -591,13 +588,9 @@ class IBin(nn.Module):
         self.im = nn.ModuleList(ImplicitM(self.no * self.na) for _ in ch)
 
     def forward(self, x):
-
-        #self.x_bin_sigmoid.use_fw_regression = True
-        #self.y_bin_sigmoid.use_fw_regression = True
         self.w_bin_sigmoid.use_fw_regression = True
         self.h_bin_sigmoid.use_fw_regression = True
-        
-        # x = x.copy()  # for profiling
+
         z = []  # inference output
         self.training |= self.export
         for i in range(self.nl):
@@ -612,17 +605,10 @@ class IBin(nn.Module):
 
                 y = x[i].sigmoid()
                 y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                #y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
-                
-
-                #px = (self.x_bin_sigmoid.forward(y[..., 0:12]) + self.grid[i][..., 0]) * self.stride[i]
-                #py = (self.y_bin_sigmoid.forward(y[..., 12:24]) + self.grid[i][..., 1]) * self.stride[i]
 
                 pw = self.w_bin_sigmoid.forward(y[..., 2:24]) * self.anchor_grid[i][..., 0]
                 ph = self.h_bin_sigmoid.forward(y[..., 24:46]) * self.anchor_grid[i][..., 1]
 
-                #y[..., 0] = px
-                #y[..., 1] = py
                 y[..., 2] = pw
                 y[..., 3] = ph
                 
@@ -632,15 +618,10 @@ class IBin(nn.Module):
 
         return x if self.training else (torch.cat(z, 1), x)
 
-    @staticmethod
-    def _make_grid(nx=20, ny=20):
-        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
-        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
-
 
 class Model(nn.Module):
     def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None, img_size=640):  # model, input channels, number of classes
-        super(Model, self).__init__()
+        super().__init__()
         self.traced = False
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
@@ -660,7 +641,6 @@ class Model(nn.Module):
             self.yaml['anchors'] = round(anchors)  # override yaml value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
-        # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
@@ -671,7 +651,6 @@ class Model(nn.Module):
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             self._initialize_biases()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IDetect) or isinstance(m, IDetect_AA):
             s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
@@ -679,17 +658,14 @@ class Model(nn.Module):
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             self._initialize_biases() if isinstance(m, IDetect) else self._initialize_biases_AA()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
-              
+
         if isinstance(m, IAuxDetect):
             s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))[:4]])  # forward
-            #print(m.stride)
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             self._initialize_aux_biases()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IBin):
             s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
@@ -697,7 +673,6 @@ class Model(nn.Module):
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             self._initialize_biases_bin()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IKeypoint):
             s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
@@ -705,7 +680,6 @@ class Model(nn.Module):
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
             self._initialize_biases_kpt()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
 
         # Init weights, biases
         initialize_weights(self)
@@ -754,14 +728,14 @@ class Model(nn.Module):
                 for _ in range(10):
                     m(x.copy() if c else x)
                 dt.append((time_synchronized() - t) * 100)
-                print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
+                logger.debug('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
 
             x = m(x)  # run
             
             y.append(x if m.i in self.save else None)  # save output
 
         if profile:
-            print('%.1fms total' % sum(dt))
+            logger.debug('%.1fms total' % sum(dt))
         return x
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
@@ -827,7 +801,7 @@ class Model(nn.Module):
         m = self.model[-1]  # Detect() module
         for mi in m.m:  # from
             b = mi.bias.detach().view(m.na, -1).T  # conv.bias(255) to (3,85)
-            print(('%6g Conv2d.bias:' + '%10.3g' * 6) % (mi.weight.shape[1], *b[:5].mean(1).tolist(), b[5:].mean()))
+            logger.debug(('%6g Conv2d.bias:' + '%10.3g' * 6) % (mi.weight.shape[1], *b[:5].mean(1).tolist(), b[5:].mean()))
 
     # def _print_weights(self):
     #     for m in self.model.modules():
@@ -835,13 +809,11 @@ class Model(nn.Module):
     #             print('%10.3g' % (m.w.detach().sigmoid() * 2))  # shortcut weights
 
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
-        print('Fusing layers... ')
+        logger.info('Fusing layers... ')
         for m in self.model.modules():
             if isinstance(m, RepConv):
-                #print(f" fuse_repvgg_block")
                 m.fuse_repvgg_block()
             elif isinstance(m, RepConv_OREPA):
-                #print(f" switch_to_deploy")
                 m.switch_to_deploy()
             elif type(m) is Conv and hasattr(m, 'bn'):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
@@ -857,19 +829,19 @@ class Model(nn.Module):
     def nms(self, mode=True):  # add or remove NMS module
         present = type(self.model[-1]) is NMS  # last layer is NMS
         if mode and not present:
-            print('Adding NMS... ')
+            logger.info('Adding NMS... ')
             m = NMS()  # module
             m.f = -1  # from
             m.i = self.model[-1].i + 1  # index
             self.model.add_module(name='%s' % m.i, module=m)  # add
             self.eval()
         elif not mode and present:
-            print('Removing NMS... ')
+            logger.info('Removing NMS... ')
             self.model = self.model[:-1]  # remove
         return self
 
     def autoshape(self):  # add autoShape module
-        print('Adding autoShape... ')
+        logger.info('Adding autoShape... ')
         m = autoShape(self)  # wrap model
         copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # copy attributes
         return m
@@ -895,7 +867,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in [nn.Conv2d, Conv, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC, 
-                 SPP, SPPF, SPPCSPC, GhostSPPCSPC, MixConv2d, Focus, Stem, GhostStem, CrossConv, 
+                 SPP, SPPF, SPPCSPC, GhostSPPCSPC, Focus, Stem, GhostStem,
                  Bottleneck, BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
                  RepBottleneck, RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC,  
                  Res, ResCSPA, ResCSPB, ResCSPC, 

@@ -55,7 +55,7 @@ class SigmoidBin(nn.Module):
         self.step = step
         #print(f" start = {start}, end = {end}, step = {step} ")
 
-        bins = torch.range(start, end + 0.0001, step).float() 
+        bins = torch.arange(start, end + 0.0001, step).float() 
         self.register_buffer('bins', bins) 
                
 
@@ -420,7 +420,17 @@ class APLoss(torch.autograd.Function):
 
 
 class ComputeLoss:
-    # Compute losses
+    """Standard YOLOv7 loss computation with AA-YOLO support.
+
+    Computes the combined loss from box regression (CIoU), objectness,
+    and classification branches. When loss_AA=1 in hyperparameters,
+    uses MSELoss for objectness (compatible with anomaly scores)
+    instead of BCEWithLogitsLoss.
+
+    Args:
+        model: The YOLO model instance.
+        autobalance: Whether to auto-balance loss across detection layers.
+    """
     def __init__(self, model, autobalance=False):
         super(ComputeLoss, self).__init__()
         device = next(model.parameters()).device  # get model device
@@ -440,11 +450,12 @@ class ComputeLoss:
         # if h['loss_AA'] is not None:
         #     l_aa = h['loss_AA']
         #     BCEobj = nn.MSELoss() if l_aa==1 else BCEobj
-        try:
-            l_aa = h['loss_AA']
-        except KeyError as e:
-            l_aa =  None
-        BCEobj = nn.MSELoss() if l_aa==1 else BCEobj
+        # Objectness loss: 0/None=BCE, 1=MSE (AA-YOLO), 2=Huber (AA-YOLO robust)
+        l_aa = h.get('loss_AA', None)
+        if l_aa == 1:
+            BCEobj = nn.MSELoss()
+        elif l_aa == 2:
+            BCEobj = nn.HuberLoss(delta=0.5)
 
         det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
@@ -502,6 +513,12 @@ class ComputeLoss:
         bs = tobj.shape[0]  # batch size
 
         loss = lbox + lobj + lcls
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"ComputeLoss: non-finite loss detected (lbox={lbox.item():.4f}, "
+                f"lobj={lobj.item():.4f}, lcls={lcls.item():.4f}). "
+                f"Check for NaN in targets or predictions."
+            )
         return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
     def build_targets(self, p, targets):
@@ -562,7 +579,16 @@ class ComputeLoss:
 
 
 class ComputeLossOTA:
-    # Compute losses
+    """OTA (Optimal Transport Assignment) loss with AA-YOLO support.
+
+    Uses optimal transport for positive sample assignment instead of
+    the standard grid-based approach. Supports anomaly-aware objectness
+    via MSELoss when loss_AA=1.
+
+    Args:
+        model: The YOLO model instance.
+        autobalance: Whether to auto-balance loss across detection layers.
+    """
     def __init__(self, model, autobalance=False):
         super(ComputeLossOTA, self).__init__()
         device = next(model.parameters()).device  # get model device
@@ -580,12 +606,12 @@ class ComputeLossOTA:
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
 
-        try:
-            l_aa = h['loss_AA']
-        except KeyError as e:
-            l_aa =  None
-            
-        BCEobj = nn.MSELoss() if l_aa==1 else BCEobj
+        # Objectness loss: 0/None=BCE, 1=MSE (AA-YOLO), 2=Huber (AA-YOLO robust)
+        l_aa = h.get('loss_AA', None)
+        if l_aa == 1:
+            BCEobj = nn.MSELoss()
+        elif l_aa == 2:
+            BCEobj = nn.HuberLoss(delta=0.5)
         det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
@@ -646,10 +672,16 @@ class ComputeLossOTA:
         bs = tobj.shape[0]  # batch size
 
         loss = lbox + lobj + lcls
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"ComputeLossOTA: non-finite loss detected (lbox={lbox.item():.4f}, "
+                f"lobj={lobj.item():.4f}, lcls={lcls.item():.4f}). "
+                f"Check for NaN in targets or predictions."
+            )
         return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
     def build_targets(self, p, targets, imgs):
-        
+
         #indices, anch = self.find_positive(p, targets)
         indices, anch = self.find_3_positive(p, targets)
         #indices, anch = self.find_4_positive(p, targets)

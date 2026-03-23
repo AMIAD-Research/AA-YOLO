@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aayolo" 
 version = "0.1.0"
-description = "Pytorch implementation of SSBroyden" 
+description = "Anomaly-Aware YOLO for Infrared Small Target Detection" 
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 authors = [
   {name = "Alina Ciocarlan", email = "alina.ciocarlan@polytechnique.edu"},
 ]
@@ -33,3 +33,20 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["models*", "utils*"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501", "E741"]
+
+[tool.ruff.isort]
+known-first-party = ["models", "utils"]
+
+[tool.black]
+line-length = 120
+target-version = ["py39"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -1,6 +1,8 @@
+import logging
 import math
 from copy import copy
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -11,6 +13,8 @@ import torch.nn.functional as F
 from torchvision.ops import DeformConv2d
 from PIL import Image
 from torch.cuda import amp
+
+logger = logging.getLogger(__name__)
 
 from utils.datasets import letterbox
 from utils.general import non_max_suppression, make_divisible, scale_coords, increment_path, xyxy2xywh
@@ -2022,75 +2026,192 @@ class ST2CSPC(nn.Module):
 ##### Anomaly-Aware YOLO #####
 
 
+class ChannelAttention(nn.Module):
+    """Squeeze-and-Excitation channel attention module.
+
+    Learns per-channel importance weights to emphasize informative
+    channels for anomaly detection in infrared imagery.
+
+    Args:
+        channels: Number of input/output channels.
+        reduction: Channel reduction ratio for the bottleneck (default: 4).
+    """
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.size()
+        w = self.squeeze(x).view(b, c)
+        w = self.excitation(w).view(b, c, 1, 1)
+        return x * w
+
+
 class filtering2D(nn.Module):
-    # 2D filtering before statistical criterion
-    def __init__(self, ch1, ch2):
-        super(filtering2D, self).__init__()
+    """2D convolutional filtering module for anomaly-aware detection.
+
+    Applies two successive Conv→BN→ReLU blocks followed by channel
+    attention (SE module) to produce filtered feature maps before
+    statistical anomaly testing.
+
+    Args:
+        ch1: Number of input channels from the backbone feature map.
+        ch2: Number of output channels (typically na * aa_chan).
+        use_attention: Whether to apply channel attention (default: True).
+    """
+    def __init__(self, ch1: int, ch2: int, use_attention: bool = True) -> None:
+        super().__init__()
         self.conv1 = nn.Conv2d(ch1, ch2, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(ch2)
         self.act1 = nn.ReLU()
         self.conv2 = nn.Conv2d(ch2, ch2, kernel_size=3, stride=1, padding=1)
         self.bn2 = nn.BatchNorm2d(ch2)
         self.act2 = nn.ReLU()
+        self.attention = ChannelAttention(ch2) if use_attention else nn.Identity()
 
-    def forward(self, x):
-        y1 = self.conv1(x)
-        y1 = self.bn1(y1)
-        y1 = self.act1(y1)
-        y1 = self.conv2(y1)
-        y1 = self.bn2(y1)
-        y1 = self.act2(y1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y1 = self.act1(self.bn1(self.conv1(x)))
+        y1 = self.act2(self.bn2(self.conv2(y1)))
+        y1 = self.attention(y1)
         return y1
+
+Filtering2D = filtering2D  # PEP8 alias
 
 
 class lnGamma(Function):
+    """Custom autograd function for log of upper incomplete gamma function.
+
+    Computes log(Gamma_upper(a, x) / Gamma(a)) with numerically stable
+    backward pass when the output approaches zero. Used in the anomaly
+    score computation for statistical hypothesis testing.
+
+    The forward pass uses torch.special.gammaincc with a fallback
+    approximation for numerical stability when the result is inf/nan.
     """
-    Custom autograd function for log of upper incomplete gamma function, with stable backward when the output is close to zero.
-	"""
-    
-    @staticmethod
-    def forward(ctx,x, a=torch.tensor(1)):
-        ret = torch.log(torch.special.gammaincc(a, x))
-        mask = torch.isinf(ret) | torch.isnan(ret)
-        ret[mask] = - x[mask] + (a-1)* torch.log(x[mask]) - torch.special.gammaln(a) 
-        ctx.save_for_backward(x,a)
-        return ret 
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def forward(ctx, x: torch.Tensor, a: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if a is None:
+            a = torch.tensor(1, device=x.device)
+        ret = torch.log(torch.special.gammaincc(a, x))
+        mask = torch.isinf(ret) | torch.isnan(ret)
+        ret[mask] = - x[mask] + (a-1)* torch.log(x[mask]) - torch.special.gammaln(a)
+        ctx.save_for_backward(x,a)
+        return ret
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
         x,a = ctx.saved_tensors
-        delta = -x**(a-1) * torch.exp(-x) / torch.special.gammaincc(a, x)     
+        delta = -x**(a-1) * torch.exp(-x) / torch.special.gammaincc(a, x)
         mask = torch.isinf(delta) | torch.isnan(delta)
-        delta[mask] = (a-1)/x[mask] -torch.tensor(1, device = x.device) 
+        nan_ratio = mask.float().mean().item()
+        if nan_ratio > 0.1:
+            logger.warning(f"lnGamma backward: {nan_ratio:.1%} of gradients are NaN/inf — "
+                           f"possible training instability (x range: [{x.min():.2e}, {x.max():.2e}])")
+        delta[mask] = (a-1)/x[mask] -torch.tensor(1, device = x.device)
+        # Clamp gradients to prevent explosion
+        delta = delta.clamp(-1e4, 1e4)
         return grad_output*delta, None
+
+LnGamma = lnGamma  # PEP8 alias
 
 def sigmoid(x):
     return 1/(1 + torch.exp(-x))
 
 
 class anomaly_testing(nn.Module):
-    """ Anomaly score prediction module
+    """Anomaly score prediction module.
+
+    Computes anomaly scores using statistical testing on filtered features.
+    Uses exponential moving average for stable inference.
+
+    Args:
+        alpha: Scaling factor for sigmoid activation (default: 0.05)
+        ema_momentum: Momentum for EMA updates during training (default: 0.1)
+        inference_ema_weight: Weight given to EMA estimate during inference (default: 0.15)
     """
-    def __init__(self):
+    MIN_EPS = 1e-7
+    MAX_LAMBDA = 1e6  # Prevent extreme scaling values
+
+    def __init__(self, alpha=0.05, ema_momentum=0.1, inference_ema_weight=0.15):
         super().__init__()
+        self.alpha = alpha
+        self.ema_momentum = ema_momentum
+        self.inference_ema_weight = inference_ema_weight
+        self.export_mode = False  # Set True for ONNX export (avoids gammaincc)
+        # Temperature scaling for post-training confidence calibration
+        # Set via calibrate_temperature() after training; 1.0 = no effect
+        self.register_buffer('temperature', torch.ones(1))
+        # Register buffer in __init__ for deterministic checkpoint behavior
+        self.register_buffer('lambda_ema', torch.ones(1))
+        self._ema_initialized = False
+
+    def _safe_reciprocal(self, x):
+        """Compute 1/x with adaptive EPS to prevent extreme values in low-intensity scenes."""
+        eps = torch.clamp(x.abs().mean() * 1e-5, min=self.MIN_EPS)
+        result = 1.0 / (x.float() + eps)
+        return result.clamp(-self.MAX_LAMBDA, self.MAX_LAMBDA)
 
     def forward(self, x):
         batch, C, h, w = x.size()
         meanx = torch.mean(x, dim=[1,2,3], keepdim=True).float()
-        if not hasattr(self, 'lambda_ema'):
-            self.register_buffer('lambda_ema', meanx.mean(0).detach())
-        if self.training: 
-            # compute and save EMA of meanx for each channel, and use it for more stable inference           
-            self.lambda_ema *= 0.9
-            self.lambda_ema += 0.1 * meanx.mean(0).detach()
-            lambda_chan = 1 / (meanx.float() + 10**(-7))
+
+        # Initialize EMA from first batch if not yet done
+        if not self._ema_initialized:
+            self.lambda_ema = meanx.mean(0).detach()
+            self._ema_initialized = True
+
+        if self.training:
+            self.lambda_ema = (1 - self.ema_momentum) * self.lambda_ema + \
+                              self.ema_momentum * meanx.mean(0).detach()
+            lambda_chan = self._safe_reciprocal(meanx)
             x = lambda_chan * x
         else:
-            lambda_chan = 1 / (meanx.float() + 10**(-7))
-            x = (0.07 * 1 / (self.lambda_ema + 10**(-7)) + 0.93 * lambda_chan) * x
-        x1 = torch.linalg.norm(x.float(), dim=1, ord=1, keepdim=True)
-        x1 = -lnGamma.apply(x1, torch.tensor(C, device = x1.device))
+            lambda_chan = self._safe_reciprocal(meanx)
+            lambda_ema_inv = self._safe_reciprocal(self.lambda_ema)
+            x = (self.inference_ema_weight * lambda_ema_inv +
+                 (1 - self.inference_ema_weight) * lambda_chan) * x
 
-        x1 = 2 * sigmoid(0.001 * x1) - 1  # activation function with parameter alpha = 0.001
-        
+        x1 = torch.linalg.norm(x.float(), dim=1, ord=1, keepdim=True)
+        if self.export_mode:
+            # ONNX-compatible approximation: log(gammaincc(a, x)) ≈ -x + (a-1)*log(x) - lgamma(a)
+            # This is the asymptotic expansion, valid for x >> a (typical at inference)
+            a = torch.tensor(float(C), device=x1.device)
+            x1_safe = x1.clamp(min=1e-6)
+            x1 = -(- x1_safe + (a - 1) * torch.log(x1_safe) - torch.lgamma(a))
+        else:
+            x1 = -lnGamma.apply(x1, torch.tensor(C, device=x1.device))
+        x1 = 2 * sigmoid(self.alpha * x1 / self.temperature) - 1
         return x1
+
+    def calibrate_temperature(self, val_scores, val_labels, lr=0.01, max_iter=50):
+        """Calibrate temperature scaling on a validation set (post-training).
+
+        Args:
+            val_scores: Tensor of raw anomaly scores from validation set.
+            val_labels: Binary tensor (1 = anomaly/target, 0 = background).
+            lr: Learning rate for temperature optimization.
+            max_iter: Maximum optimization iterations.
+        """
+        temperature = nn.Parameter(torch.ones(1, device=val_scores.device))
+        optimizer = torch.optim.LBFGS([temperature], lr=lr, max_iter=max_iter)
+        criterion = nn.BCEWithLogitsLoss()
+
+        def closure():
+            optimizer.zero_grad()
+            loss = criterion(val_scores / temperature, val_labels.float())
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        self.temperature.fill_(temperature.item())
+        return temperature.item()
+
+AnomalyTesting = anomaly_testing  # PEP8 alias

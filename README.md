@@ -15,13 +15,13 @@ Welcome to the official implementation repository of our [paper](https://doi.org
 1. Clone this repository: `git clone https://github.com/AMIAD-Research/AA-YOLO.git`
 2. Follow the [yolov7 installation instructions](https://github.com/WongKinYiu/yolov7) to install dependencies and build the project. 🔧
 
-You can also install the depedencies by running the following command: 
+You can also install the dependencies by running the following command: 
 ```uv sync```
 3. Prepare the datasets in the YOLO format (see below for more details).
 
 ### Dataset Preparation
 
-For the SIRST dataset, dowload the [dataset](https://github.com/YimianDai/sirst) and place the images in `data/datasets/SIRST/images`. For the IRSTD-1k dataset, dowload the [dataset](https://github.com/RuiZhang97/ISNet) and place the images in `data/datasets/IRSTD-1k/images`. 
+For the SIRST dataset, download the [dataset](https://github.com/YimianDai/sirst) and place the images in `data/datasets/SIRST/images`. For the IRSTD-1k dataset, download the [dataset](https://github.com/RuiZhang97/ISNet) and place the images in `data/datasets/IRSTD-1k/images`. 
 
 The YOLO format labels are already provided in this repo. 
 

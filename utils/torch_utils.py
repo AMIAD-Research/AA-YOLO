@@ -278,15 +278,29 @@ class ModelEMA:
     GPU assignment and distributed training wrappers.
     """
 
-    def __init__(self, model, decay=0.9999, updates=0):
+    def __init__(self, model, decay=0.9999, updates=0, epochs=None):
         # Create EMA
         self.ema = deepcopy(model.module if is_parallel(model) else model).eval()  # FP32 EMA
         # if next(model.parameters()).device.type != 'cpu':
         #     self.ema.half()  # FP16 EMA
         self.updates = updates  # number of EMA updates
-        self.decay = lambda x: decay * (1 - math.exp(-x / 2000))  # decay exponential ramp (to help early epochs)
+        self.epochs = epochs
+        self.current_epoch = 0
+        if epochs is not None:
+            # Epoch-aware decay: ramp from 0.999 to 0.9999 over training,
+            # combined with the per-update exponential ramp
+            self.base_decay = decay
+            self.decay = lambda x: min(self.base_decay,
+                                       0.999 + (self.current_epoch / max(self.epochs, 1)) * 0.0009
+                                       ) * (1 - math.exp(-x / 2000))
+        else:
+            self.decay = lambda x: decay * (1 - math.exp(-x / 2000))  # decay exponential ramp (to help early epochs)
         for p in self.ema.parameters():
             p.requires_grad_(False)
+
+    def set_epoch(self, epoch):
+        """Update the current epoch for decay scheduling."""
+        self.current_epoch = epoch
 
     def update(self, model):
         # Update EMA parameters

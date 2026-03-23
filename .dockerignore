@@ -1,0 +1,11 @@
+.git
+__pycache__
+*.pyc
+*.pt
+runs/
+data/datasets/
+.pre-commit-config.yaml
+.github/
+*.egg-info
+dist/
+build/

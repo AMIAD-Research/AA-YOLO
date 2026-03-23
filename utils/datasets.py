@@ -581,6 +581,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             # Augment colorspace
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
 
+            # IR-specific augmentations
+            img = augment_ir(img)
+
             # Apply cutouts
             # if random.random() < 0.9:
             #     labels = cutout(img, labels)
@@ -690,6 +693,31 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
 
     img_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val))).astype(dtype)
     cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)  # no return needed
+
+
+def augment_ir(img, noise_std_range=(0, 0.03), gamma_range=(0.7, 1.3)):
+    """IR-specific augmentations for thermal sensor simulation.
+
+    Args:
+        img: Input image
+        noise_std_range: Range for Gaussian noise std (simulates thermal sensor noise)
+        gamma_range: Range for gamma correction (simulates varying IR contrast)
+    """
+    dtype = img.dtype
+    img = img.astype(np.float32) / 255.0
+
+    # Add Gaussian noise (simulates thermal sensor noise)
+    noise_std = np.random.uniform(*noise_std_range)
+    noise = np.random.normal(0, noise_std, img.shape)
+    img = np.clip(img + noise, 0, 1)
+
+    # Contrast jitter via gamma correction (simulates varying IR scene contrast)
+    gamma = np.random.uniform(*gamma_range)
+    img = np.power(img, gamma)
+
+    # Convert back to original dtype
+    img = (np.clip(img, 0, 1) * 255).astype(dtype)
+    return img
 
 
 def hist_equalize(img, clahe=True, bgr=False):

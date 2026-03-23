@@ -41,6 +41,17 @@ def detect(save_img=False):
     if half:
         model.half()  # to FP16
 
+    # Set model to eval mode
+    model.eval()
+
+    # Optional: compile model for faster inference (PyTorch 2.0+)
+    if hasattr(torch, 'compile') and not opt.no_compile:
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+            print('Model compiled with torch.compile()')
+        except Exception as e:
+            print(f'torch.compile() failed, running without compilation: {e}')
+
     # Second-stage classifier
     classify = False
     if classify:
@@ -183,6 +194,7 @@ if __name__ == '__main__':
     parser.add_argument('--name', default='exp', help='save results to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
+    parser.add_argument('--no-compile', action='store_true', help='disable torch.compile() optimization')
     opt = parser.parse_args()
     print(opt)
     #check_requirements(exclude=('pycocotools', 'thop'))

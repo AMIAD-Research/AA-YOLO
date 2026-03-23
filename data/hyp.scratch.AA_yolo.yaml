@@ -8,7 +8,7 @@ warmup_bias_lr: 0.1  # warmup initial bias lr
 box: 0.05  # box loss gain
 cls: 0.3  # cls loss gain
 cls_pw: 1.0  # cls BCELoss positive_weight
-obj: 0.7  # obj loss gain (scale with pixels)
+obj: 0.85  # obj loss gain (scale with pixels)
 obj_pw: 1.0  # obj BCELoss positive_weight
 iou_t: 0.20  # IoU training threshold
 anchor_t: 4.0  # anchor-multiple threshold
@@ -30,3 +30,7 @@ copy_paste: 0.0  # image copy paste (probability)
 paste_in: 0.15  # image copy paste (probability), use 0 for faster training
 loss_ota: 1 # use ComputeLossOTA, use 0 for faster training
 loss_AA: 1
+anomaly_alpha: 0.05  # sigmoid scaling in anomaly_testing (default was 0.001)
+anomaly_ema_momentum: 0.1  # EMA momentum for anomaly module
+anomaly_inference_ema_weight: 0.15  # EMA weight at inference (default was 0.07)
+anomaly_lr_mult: 2.0  # learning rate multiplier for anomaly modules (filtering, stat_test)
